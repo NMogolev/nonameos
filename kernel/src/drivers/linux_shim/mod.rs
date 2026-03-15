@@ -13,22 +13,22 @@
 //
 // Стратегия реализации:
 //
-//   Этап 1 (сейчас):
-//     - kmalloc / kfree / kzalloc     → наш физический аллокатор (page-level)
-//     - ioremap / iounmap             → identity mapping (первый 1 GB уже замаплен)
-//     - printk                        → наш println!
+//   Этап 1:
+//     - kmalloc / kfree / kzalloc     → физический аллокатор
+//     - ioremap / iounmap             → identity mapping
+//     - printk                        → println!
 //     - spin_lock / spin_unlock       → spin::Mutex
 //     - udelay / mdelay               → busy-wait
-//     - request_irq / free_irq        → наш IDT
+//     - request_irq / free_irq        → IDT
 //
-//   Этап 2 (будущее):
+//   Этап 2:
 //     - vmalloc / vfree               → виртуальный аллокатор
 //     - dma_alloc_coherent            → DMA-совместимые буферы
 //     - workqueue                     → отложенная обработка
 //     - wait_event / wake_up          → блокировка потоков
 //     - struct pci_driver              → интеграция с нашим PCI
 //
-//   Этап 3 (для Mesa/GPU):
+//   Этап 3:
 //     - struct drm_device             → DRM подсистема
 //     - gem / ttm                     → управление видеопамятью
 //     - fb_ops                        → framebuffer
@@ -42,6 +42,73 @@
 // =============================================================================
 
 use crate::memory::{phys, PAGE_SIZE, align_up};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
+
+// =============================================================================
+// Аллокационная таблица: отслеживание размера kmalloc аллокаций
+// =============================================================================
+//
+// Без heap-аллокатора мы не можем использовать HashMap.
+// Простой массив (addr, page_count) — достаточно для MVP.
+// Максимум MAX_ALLOC_ENTRIES одновременных аллокаций.
+
+const MAX_ALLOC_ENTRIES: usize = 256;
+
+struct AllocEntry {
+    addr: usize,      // физический адрес (0 = свободный слот)
+    page_count: usize, // сколько страниц выделено
+}
+
+static ALLOC_TABLE_LOCK: AtomicBool = AtomicBool::new(false);
+static mut ALLOC_TABLE: [AllocEntry; MAX_ALLOC_ENTRIES] = {
+    const EMPTY: AllocEntry = AllocEntry { addr: 0, page_count: 0 };
+    [EMPTY; MAX_ALLOC_ENTRIES]
+};
+
+/// Записать аллокацию в таблицу.
+fn alloc_table_insert(addr: usize, pages: usize) {
+    while ALLOC_TABLE_LOCK.compare_exchange_weak(
+        false, true, Ordering::Acquire, Ordering::Relaxed
+    ).is_err() {
+        core::hint::spin_loop();
+    }
+    unsafe {
+        let table = core::ptr::addr_of_mut!(ALLOC_TABLE);
+        for i in 0..MAX_ALLOC_ENTRIES {
+            let entry = &mut (*table)[i];
+            if entry.addr == 0 {
+                entry.addr = addr;
+                entry.page_count = pages;
+                break;
+            }
+        }
+    }
+    ALLOC_TABLE_LOCK.store(false, Ordering::Release);
+}
+
+/// Найти и удалить аллокацию, вернуть количество страниц.
+fn alloc_table_remove(addr: usize) -> usize {
+    while ALLOC_TABLE_LOCK.compare_exchange_weak(
+        false, true, Ordering::Acquire, Ordering::Relaxed
+    ).is_err() {
+        core::hint::spin_loop();
+    }
+    let mut pages = 0;
+    unsafe {
+        let table = core::ptr::addr_of_mut!(ALLOC_TABLE);
+        for i in 0..MAX_ALLOC_ENTRIES {
+            let entry = &mut (*table)[i];
+            if entry.addr == addr {
+                pages = entry.page_count;
+                entry.addr = 0;
+                entry.page_count = 0;
+                break;
+            }
+        }
+    }
+    ALLOC_TABLE_LOCK.store(false, Ordering::Release);
+    pages
+}
 
 // =============================================================================
 // Память: kmalloc / kfree / kzalloc
@@ -69,13 +136,18 @@ pub const GFP_ZERO: GfpFlags   = 0x8;
 /// Выделить память в ядре.
 ///
 /// `size` — размер в байтах.
-/// `flags` — GFP флаги (пока игнорируются).
+/// `flags` — GFP флаги (GFP_ZERO обнуляет; остальные пока игнорируются).
 ///
 /// Возвращает указатель на начало выделенной памяти,
 /// или null если памяти нет.
 ///
 /// Сейчас выделяет целые страницы (4 KiB гранулярность).
-/// TODO: slab allocator для мелких объектов.
+/// Multi-page аллокации: при неудаче все уже выделенные страницы
+/// корректно откатываются (нет утечки).
+///
+/// ОГРАНИЧЕНИЕ: multi-page аллокации предполагают, что аллокатор
+/// выдаёт последовательные фреймы. Это НЕ гарантировано.
+/// TODO: buddy allocator для настоящих contiguous аллокаций.
 pub fn kmalloc(size: usize, flags: GfpFlags) -> *mut u8 {
     if size == 0 {
         return core::ptr::null_mut();
@@ -83,42 +155,42 @@ pub fn kmalloc(size: usize, flags: GfpFlags) -> *mut u8 {
 
     let pages_needed = align_up(size, PAGE_SIZE) / PAGE_SIZE;
 
-    // Пока выделяем только одну страницу.
-    // Для multi-page: нужен buddy allocator.
-    if pages_needed > 1 {
-        // Временное решение: выделяем pages_needed страниц подряд
-        // (это работает только если аллокатор выдаёт последовательные фреймы,
-        //  что не гарантировано. TODO: buddy allocator)
-        let first = phys::alloc_frame();
-        match first {
-            Some(addr) => {
-                // Выделяем остальные
-                for _ in 1..pages_needed {
-                    if phys::alloc_frame().is_none() {
-                        // Не хватило — утечка предыдущих. TODO: откат.
-                        return core::ptr::null_mut();
-                    }
-                }
-                let ptr = addr as *mut u8;
-                if flags & GFP_ZERO != 0 {
-                    unsafe { core::ptr::write_bytes(ptr, 0, pages_needed * PAGE_SIZE); }
-                }
-                ptr
-            }
-            None => core::ptr::null_mut(),
-        }
-    } else {
+    // Массив для отката: храним адреса выделенных фреймов.
+    // Ограничение: максимум 64 страниц (256 KiB) за один kmalloc.
+    const MAX_PAGES_PER_ALLOC: usize = 64;
+    if pages_needed > MAX_PAGES_PER_ALLOC {
+        return core::ptr::null_mut();
+    }
+
+    let mut frames: [usize; MAX_PAGES_PER_ALLOC] = [0; MAX_PAGES_PER_ALLOC];
+    let mut allocated = 0usize;
+
+    for i in 0..pages_needed {
         match phys::alloc_frame() {
             Some(addr) => {
-                let ptr = addr as *mut u8;
-                if flags & GFP_ZERO != 0 {
-                    unsafe { core::ptr::write_bytes(ptr, 0, PAGE_SIZE); }
-                }
-                ptr
+                frames[i] = addr;
+                allocated += 1;
             }
-            None => core::ptr::null_mut(),
+            None => {
+                // Откат: освобождаем все уже выделенные фреймы
+                for j in 0..allocated {
+                    phys::free_frame(frames[j]);
+                }
+                return core::ptr::null_mut();
+            }
         }
     }
+
+    let ptr = frames[0] as *mut u8;
+
+    // Записываем в таблицу аллокаций для корректного kfree
+    alloc_table_insert(frames[0], pages_needed);
+
+    if flags & GFP_ZERO != 0 {
+        unsafe { core::ptr::write_bytes(ptr, 0, pages_needed * PAGE_SIZE); }
+    }
+
+    ptr
 }
 
 /// Выделить обнулённую память.
@@ -128,16 +200,24 @@ pub fn kzalloc(size: usize, flags: GfpFlags) -> *mut u8 {
 
 /// Освободить память, выделенную через kmalloc.
 ///
-/// Сейчас освобождаем только первую страницу.
-/// TODO: отслеживать размер аллокации.
+/// Использует таблицу аллокаций для определения количества страниц.
+/// Если аллокация не найдена — освобождает одну страницу (fallback).
 pub fn kfree(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
     let addr = ptr as usize;
-    // Выравниваем на страницу
     let frame_addr = addr & !(PAGE_SIZE - 1);
-    phys::free_frame(frame_addr);
+
+    let pages = alloc_table_remove(frame_addr);
+    if pages == 0 {
+        // Не нашли в таблице — освобождаем одну страницу (legacy fallback)
+        phys::free_frame(frame_addr);
+    } else {
+        for i in 0..pages {
+            phys::free_frame(frame_addr + i * PAGE_SIZE);
+        }
+    }
 }
 
 // =============================================================================
@@ -151,15 +231,26 @@ pub fn kfree(ptr: *mut u8) {
 // поэтому для устройств в этом диапазоне ioremap — тождественное отображение.
 // Для адресов выше 1 ГиБ (PCIe BARs) нужно будет создавать маппинги.
 
+/// Максимальный физический адрес, покрытый identity mapping (boot.asm).
+const IDENTITY_MAP_LIMIT: u64 = 0x4000_0000; // 1 GiB
+
 /// Замапить физический адрес устройства для доступа из ядра.
 ///
-/// Пока: identity mapping (физ. адрес = вирт. адрес).
-/// TODO: для адресов > 1 GB создавать маппинг через paging.
-pub fn ioremap(phys_addr: u64, size: u64) -> *mut u8 {
-    // Адреса в первом 1 GB уже замаплены через identity mapping
-    // Для PCI BAR обычно < 4 GB, но может быть и выше.
-    // TODO: создать маппинг для высоких адресов
-    phys_addr as *mut u8
+/// Поддерживает только адреса < 1 GiB (identity mapping из boot.asm).
+/// Для адресов >= 1 GiB возвращает None.
+///
+/// Возвращает `Option<*mut u8>` вместо голого указателя,
+/// чтобы драйвер мог корректно обработать ошибку.
+///
+/// TODO: для высоких адресов создавать маппинг через paging модуль.
+pub fn ioremap(phys_addr: u64, _size: u64) -> Option<*mut u8> {
+    if phys_addr < IDENTITY_MAP_LIMIT {
+        Some(phys_addr as *mut u8)
+    } else {
+        // Адрес выше identity map — нужен page table mapping.
+        // Пока не реализовано.
+        None
+    }
 }
 
 /// Отменить маппинг MMIO региона.
@@ -231,13 +322,44 @@ pub unsafe fn writeb(value: u8, addr: *mut u8) {
 // В Linux udelay() использует calibrated busy-loop (BogoMIPS).
 // У нас пока грубый busy-wait.
 
-/// Задержка в микросекундах (busy-wait, приблизительная).
+/// Частота CPU в MHz для TSC-калибровки.
+/// Грубая оценка — будет уточнена при инициализации через PIT.
+/// Для QEMU/KVM обычно ~2000-3000 MHz.
+static CPU_MHZ: AtomicU32 = AtomicU32::new(1000); // fallback: 1 GHz
+
+/// Установить частоту CPU (вызывать после калибровки через PIT).
+pub fn set_cpu_mhz(mhz: u32) {
+    CPU_MHZ.store(mhz, Ordering::Relaxed);
+}
+
+/// Задержка в микросекундах.
 ///
-/// Калибровка: ~1000 итераций ≈ 1 мкс на ~1 GHz CPU.
-/// Это очень приблизительно. TODO: калибровка через PIT/TSC.
+/// Использует TSC (RDTSC) для точного timing.
+/// Точность зависит от правильной калибровки CPU_MHZ.
+/// По умолчанию предполагает 1 GHz; вызовите set_cpu_mhz() для коррекции.
 pub fn udelay(us: u64) {
-    let iterations = us * 1000;
-    for _ in 0..iterations {
+    let mhz = CPU_MHZ.load(Ordering::Relaxed) as u64;
+    let target_cycles = us * mhz;
+
+    let start_lo: u32;
+    let start_hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") start_lo, out("edx") start_hi,
+            options(nomem, nostack));
+    }
+    let start = ((start_hi as u64) << 32) | (start_lo as u64);
+
+    loop {
+        let now_lo: u32;
+        let now_hi: u32;
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") now_lo, out("edx") now_hi,
+                options(nomem, nostack));
+        }
+        let now = ((now_hi as u64) << 32) | (now_lo as u64);
+        if now.wrapping_sub(start) >= target_cycles {
+            break;
+        }
         unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
     }
 }
@@ -255,9 +377,12 @@ pub fn mdelay(ms: u64) {
 // Мы используем простой атомарный спинлок.
 // В будущем нужно добавить disable/enable interrupts.
 
-use core::sync::atomic::{AtomicBool, Ordering};
-
 /// Простой спинлок (аналог spinlock_t в Linux).
+///
+/// Поддерживает два режима:
+///   - `lock()` / `unlock()` — без управления прерываниями
+///   - `lock_irqsave()` / `unlock_irqrestore()` — отключает IRQ,
+///     предотвращая deadlock при захвате из IRQ-контекста
 pub struct SpinLock {
     locked: AtomicBool,
 }
@@ -270,13 +395,14 @@ impl SpinLock {
     }
 
     /// Захватить лок (busy-wait до успеха).
+    /// НЕ отключает прерывания. Если лок может быть захвачен из IRQ —
+    /// используйте lock_irqsave().
     pub fn lock(&self) {
         while self.locked.compare_exchange_weak(
             false, true,
             Ordering::Acquire,
             Ordering::Relaxed
         ).is_err() {
-            // Hint для CPU: мы в spin-loop
             core::hint::spin_loop();
         }
     }
@@ -294,6 +420,54 @@ impl SpinLock {
             Ordering::Relaxed
         ).is_ok()
     }
+
+    /// Захватить лок + отключить прерывания.
+    /// Возвращает RFLAGS для последующего восстановления.
+    ///
+    /// Аналог spin_lock_irqsave() в Linux.
+    /// Предотвращает deadlock при захвате из IRQ-обработчика.
+    pub fn lock_irqsave(&self) -> u64 {
+        let flags = save_flags_and_cli();
+        self.lock();
+        flags
+    }
+
+    /// Отпустить лок + восстановить прерывания.
+    ///
+    /// Аналог spin_unlock_irqrestore() в Linux.
+    pub fn unlock_irqrestore(&self, flags: u64) {
+        self.unlock();
+        restore_flags(flags);
+    }
+}
+
+/// Сохранить RFLAGS и отключить прерывания (CLI).
+#[inline(always)]
+fn save_flags_and_cli() -> u64 {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            "cli",
+            out(reg) flags,
+            options(nomem, preserves_flags)
+        );
+    }
+    flags
+}
+
+/// Восстановить RFLAGS (включая бит IF — прерывания).
+#[inline(always)]
+fn restore_flags(flags: u64) {
+    unsafe {
+        core::arch::asm!(
+            "push {}",
+            "popfq",
+            in(reg) flags,
+            options(nomem)
+        );
+    }
 }
 
 // =============================================================================
@@ -302,9 +476,7 @@ impl SpinLock {
 //
 // Linux: atomic_t, atomic_read(), atomic_set(), atomic_add(), atomic_inc()...
 
-use core::sync::atomic::AtomicI32;
-
-/// Аналог atomic_t из Linux.
+/// Аналог atomic_t из Linux (signed 32-bit).
 pub struct AtomicInt {
     value: AtomicI32,
 }
@@ -338,6 +510,80 @@ impl AtomicInt {
         self.sub(1)
     }
 }
+
+/// Аналог atomic_t unsigned (unsigned 32-bit).
+/// Используется в Linux для счётчиков ссылок, etc.
+pub struct AtomicUint {
+    value: AtomicU32,
+}
+
+impl AtomicUint {
+    pub const fn new(val: u32) -> Self {
+        AtomicUint { value: AtomicU32::new(val) }
+    }
+
+    pub fn read(&self) -> u32 {
+        self.value.load(Ordering::SeqCst)
+    }
+
+    pub fn set(&self, val: u32) {
+        self.value.store(val, Ordering::SeqCst);
+    }
+
+    pub fn add(&self, val: u32) -> u32 {
+        self.value.fetch_add(val, Ordering::SeqCst)
+    }
+
+    pub fn sub(&self, val: u32) -> u32 {
+        self.value.fetch_sub(val, Ordering::SeqCst)
+    }
+
+    pub fn inc(&self) -> u32 {
+        self.add(1)
+    }
+
+    pub fn dec(&self) -> u32 {
+        self.sub(1)
+    }
+}
+
+/// Атомарный указатель (аналог atomic_long_t / rcu pointer в Linux).
+pub struct AtomicPtr<T> {
+    value: AtomicUsize,
+    _marker: core::marker::PhantomData<*mut T>,
+}
+
+impl<T> AtomicPtr<T> {
+    pub fn new(ptr: *mut T) -> Self {
+        AtomicPtr {
+            value: AtomicUsize::new(ptr as usize),
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    pub const fn null() -> Self {
+        AtomicPtr {
+            value: AtomicUsize::new(0),
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    pub fn load(&self) -> *mut T {
+        self.value.load(Ordering::SeqCst) as *mut T
+    }
+
+    pub fn store(&self, ptr: *mut T) {
+        self.value.store(ptr as usize, Ordering::SeqCst);
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.value.load(Ordering::SeqCst) == 0
+    }
+}
+
+// SAFETY: AtomicPtr содержит только атомарный usize
+unsafe impl<T> Send for AtomicPtr<T> {}
+unsafe impl<T> Sync for AtomicPtr<T> {}
 
 // =============================================================================
 // I/O порты
