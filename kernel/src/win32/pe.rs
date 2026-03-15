@@ -469,7 +469,7 @@ pub fn validate_dos_header(data: &[u8]) -> Result<&ImageDosHeader, NTSTATUS> {
 }
 
 /// Проверить PE Signature + COFF Header.
-pub fn validate_pe_header(data: &[u8], dos: &ImageDosHeader) -> Result<&ImageFileHeader, NTSTATUS> {
+pub fn validate_pe_header<'a>(data: &'a [u8], dos: &ImageDosHeader) -> Result<&'a ImageFileHeader, NTSTATUS> {
     let pe_offset = dos.e_lfanew as usize;
 
     // Проверяем PE signature ("PE\0\0")
@@ -496,10 +496,10 @@ pub fn validate_pe_header(data: &[u8], dos: &ImageDosHeader) -> Result<&ImageFil
 }
 
 /// Проверить Optional Header (PE32+).
-pub fn validate_optional_header(
-    data: &[u8],
+pub fn validate_optional_header<'a>(
+    data: &'a [u8],
     dos: &ImageDosHeader,
-) -> Result<&ImageOptionalHeader64, NTSTATUS> {
+) -> Result<&'a ImageOptionalHeader64, NTSTATUS> {
     let opt_offset = dos.e_lfanew as usize + 4 + core::mem::size_of::<ImageFileHeader>();
 
     if opt_offset + core::mem::size_of::<ImageOptionalHeader64>() > data.len() {
@@ -516,11 +516,11 @@ pub fn validate_optional_header(
 }
 
 /// Получить массив Section Headers.
-pub fn get_section_headers(
-    data: &[u8],
+pub fn get_section_headers<'a>(
+    data: &'a [u8],
     dos: &ImageDosHeader,
     coff: &ImageFileHeader,
-) -> Result<&[ImageSectionHeader], NTSTATUS> {
+) -> Result<&'a [ImageSectionHeader], NTSTATUS> {
     let sections_offset = dos.e_lfanew as usize
         + 4
         + core::mem::size_of::<ImageFileHeader>()

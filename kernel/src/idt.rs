@@ -368,7 +368,7 @@ pub fn init() {
         // Загружаем IDT
         let idt_ptr = IdtPointer {
             limit: (size_of::<[IdtEntry; IDT_SIZE]>() - 1) as u16,
-            base: IDT.as_ptr() as u64,
+            base: (&raw const IDT) as *const IdtEntry as u64,
         };
 
         core::arch::asm!(
@@ -406,9 +406,9 @@ pub extern "C" fn interrupt_dispatch(frame: &InterruptFrame) {
 
         // --- IRQ 0: Timer ---
         32 => {
-            // Тик таймера. Пока ничего не делаем.
-            // В будущем: обновление счётчика, вызов планировщика.
+            // Тик таймера → планировщик.
             pic::send_eoi(0);
+            crate::scheduler::timer_tick();
         }
 
         // --- IRQ 1: Keyboard ---

@@ -19,7 +19,17 @@ header_start:
     dd header_end - header_start                        ; Header length
     dd 0x100000000 - (0xe85250d6 + 0 + (header_end - header_start)) ; Checksum
 
+    ; Framebuffer tag — запрос графического режима 1024x768, 32bpp
+    align 8
+    dw 5            ; type = framebuffer
+    dw 0            ; flags = 0 (required)
+    dd 20           ; size = 20 bytes
+    dd 1024         ; width
+    dd 768          ; height
+    dd 32           ; depth (bpp)
+
     ; End tag (required)
+    align 8
     dw 0            ; type
     dw 0            ; flags
     dd 8            ; size

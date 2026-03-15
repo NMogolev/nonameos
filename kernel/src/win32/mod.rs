@@ -106,6 +106,7 @@
 //
 // =============================================================================
 
+#[allow(non_camel_case_types)]
 pub mod types;
 pub mod error;
 pub mod object;
